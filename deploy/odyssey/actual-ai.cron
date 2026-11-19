@@ -1,0 +1,3 @@
+# Installed as /etc/cron.d/actual-ai. Weekdays 06:00 and 12:00 (America/New_York).
+# To pause: comment out the line below.
+0 6,12 * * 1-5 root cd /opt/actual-ai && /usr/bin/docker compose run --rm -T actual-ai >> /var/log/actual-ai.log 2>&1

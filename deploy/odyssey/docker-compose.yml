@@ -1,0 +1,18 @@
+# Deployed to /opt/actual-ai/ on odyssey (root-owned). Run by cron, not as a daemon.
+# Secrets (password, budget/sync ID) come from .env - see .env.example.
+services:
+  actual-ai:
+    image: docker.io/sakowicz/actual-ai:latest
+    restart: "no"
+    network_mode: host
+    env_file: .env
+    environment:
+      TZ: America/New_York
+      ACTUAL_SERVER_URL: http://127.0.0.1:5006
+      LLM_PROVIDER: ollama
+      OLLAMA_BASE_URL: http://127.0.0.1:11434/api
+      OLLAMA_MODEL: frob/qwen3.5-instruct:4b
+      LLM_TEMPERATURE: "0.2"
+      GUESSED_TAG: "#actual-ai"
+      NOT_GUESSED_TAG: "#actual-ai-miss"
+      FEATURES: '["classifyOnStartup", "disableRateLimiter"]'

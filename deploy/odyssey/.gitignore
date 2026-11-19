@@ -1,0 +1,4 @@
+# Real secrets live only in /opt/actual-ai/.env on the server.
+.env
+.env.*
+!.env.example
