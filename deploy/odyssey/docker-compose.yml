@@ -2,7 +2,9 @@
 # Secrets (password, budget/sync ID) come from .env - see .env.example.
 services:
   actual-ai:
-    image: docker.io/sakowicz/actual-ai:latest
+    # Pinned: PROMPT_TEMPLATE below is 3.3.2's src/templates/prompt.hbs and relies on its variables.
+    # When upgrading, re-derive it from the new prompt.hbs (and re-run eval/backtest.mjs).
+    image: docker.io/sakowicz/actual-ai:3.3.2
     restart: "no"
     network_mode: host
     env_file: .env
@@ -16,3 +18,66 @@ services:
       GUESSED_TAG: "#actual-ai"
       NOT_GUESSED_TAG: "#actual-ai-miss"
       FEATURES: '["classifyOnStartup", "disableRateLimiter"]'
+      # Upstream default prompt with ONE change: category groups are listed without their IDs.
+      # With group IDs shown, the 4B model often answered with a group's ID (e.g. "Income"), which
+      # the app rejects -> transaction left uncategorised. Backtest (eval/backtest.mjs, 249 txns):
+      # 79.9% -> 94.0% (see deploy/odyssey/README.md).
+      PROMPT_TEMPLATE: |
+        I want to categorize the given bank transaction.
+
+        Transaction details:
+        * Amount: {{amount}}
+        * Type: {{type}}
+        {{#if description}}
+        * Description: {{description}}
+        {{/if}}
+        {{#if payee}}
+        * Payee: {{payee}}
+        {{^}}
+        * Payee: {{importedPayee}}
+        {{/if}}
+        {{#if date}}
+        * Date: {{date}}
+        {{/if}}
+
+        Existing categories by group:
+        {{#each categoryGroups}}
+        GROUP: {{name}}
+        {{#each categories}}
+        * {{name}} (ID: "{{id}}")
+        {{/each}}
+        {{/each}}
+
+        {{#if rules.length}}
+        Existing Rules:
+        {{#each rules}}
+        {{incIndex @index}}. {{ruleName}} → {{categoryName}}
+           Conditions: {{#each conditions}}{{field}} {{op}} {{value}}{{#unless @last}}, {{/unless}}{{/each}}
+        {{/each}}
+        {{/if}}
+
+        IMPORTANT: You MUST respond with ONLY a valid JSON object using this structure:
+        {
+          "type": "existing"|"new"|"rule",
+          "categoryId": "string", // Required for "existing"; for "rule" include only when the matched rule sets a category, omit when the rule says "leave uncategorized"
+          "ruleName": "string", // Required if matching rule: the rule's name exactly as listed under Existing Rules, such as "Rule 2"
+          "newCategory": { // Required if suggesting new category
+            "name": "string",
+            "groupName": "string",
+            "groupIsNew": boolean
+          }
+        }
+
+        If a rule renders as "→ leave uncategorized", that rule explicitly tells you NOT to assign a category. Match it with type "rule" and the ruleName, and OMIT categoryId — do not invent one and do not fall back to "new".
+
+        DO NOT output any text before or after the JSON. Your entire response must be a valid, parsable JSON object.
+
+        Examples:
+        {"type": "existing", "categoryId": "abc123"}
+        {"type": "rule", "categoryId": "def456", "ruleName": "Rule 2"}
+        {"type": "rule", "ruleName": "Rule 3"}
+        {"type": "new", "newCategory": {"name": "Pet Supplies", "groupName": "Pets", "groupIsNew": true}}
+
+        {{#if hasWebSearchTool}}
+        You can use the web search tool to find more information about the transaction.
+        {{/if}}

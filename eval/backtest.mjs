@@ -8,6 +8,8 @@
 //       amt       same, amount shown as dollars
 //       hNN       amt + history of the same/similar payee from the NN days before the txn
 //       majority  no LLM: most common past category for the payee (reference)
+//       suffix -ng  list category groups without their IDs (only category IDs offered)
+//       suffix -nm  no IDs at all: model answers categoryName, mapped back to the ID
 import fs from 'node:fs';
 import path from 'node:path';
 import { createRequire } from 'node:module';
@@ -16,7 +18,7 @@ const require = createRequire(import.meta.url);
 const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
 const handlebars = require(path.join(root, 'dist/src/handlebars-helpers.js')).default;
 const { transformRulesToDescriptions } = require(path.join(root, 'dist/src/utils/rule-utils.js'));
-const { parseLlmResponse } = require(path.join(root, 'dist/src/utils/json-utils.js'));
+const { parseLlmResponse, cleanJsonResponse } = require(path.join(root, 'dist/src/utils/json-utils.js'));
 const SimilarityCalculator = require(path.join(root, 'dist/src/similarity-calculator.js')).default;
 
 const args = process.argv.slice(2);
@@ -101,13 +103,38 @@ I am usually consistent per payee: prefer the category I used before unless this
 `;
 const historyTemplate = baseTemplate.replace('\nExisting categories by group:', `${historyBlock}\nExisting categories by group:`);
 if (historyTemplate === baseTemplate) throw new Error('could not insert history block');
-const compiled = { base: handlebars.compile(baseTemplate), hist: handlebars.compile(historyTemplate) };
+function variant(tpl, ng, nm) {
+  let out = tpl;
+  const sub = (a, b) => { if (!out.includes(a)) throw new Error(`template variant: missing ${a}`); out = out.split(a).join(b); };
+  if (ng || nm) sub('GROUP: {{name}} (ID: "{{id}}")', 'GROUP: {{name}}');
+  if (nm) {
+    sub('* {{name}} (ID: "{{id}}")', '* {{name}}');
+    if (out.includes('→ {{categoryName}} (ID: "{{categoryId}}")')) sub('→ {{categoryName}} (ID: "{{categoryId}}")', '→ {{categoryName}}');
+    sub('"categoryId": "string", // Required for "existing"', '"categoryName": "string", // Required for "existing": the category name exactly as listed');
+    sub('omit when the rule says', 'omit when the rule says');
+    sub('{"type": "existing", "categoryId": "abc123"}', '{"type": "existing", "categoryName": "Groceries"}');
+    sub('{"type": "rule", "categoryId": "def456", "ruleName": "Rule 2"}', '{"type": "rule", "categoryName": "Utilities", "ruleName": "Rule 2"}');
+    sub('and OMIT categoryId', 'and OMIT categoryName');
+  }
+  return out;
+}
+const compiledCache = new Map();
+const compiledFor = (hist, ng, nm) => {
+  const k = `${hist}${ng}${nm}`;
+  if (!compiledCache.has(k)) compiledCache.set(k, handlebars.compile(variant(hist ? historyTemplate : baseTemplate, ng, nm)));
+  return compiledCache.get(k);
+};
+const parseArm = (arm) => {
+  const [base, ...mods] = arm.split('-');
+  const m = base.match(/^h(\d+)$/);
+  return { rawAmount: base === 'baseline', histDays: m ? Number(m[1]) : 0, ng: mods.includes('ng'), nm: mods.includes('nm') };
+};
 
 function render(t, arm) {
   const ctx = {
     categoryGroups: groups,
     rules: rulesDescription,
-    amount: arm === 'baseline' ? Math.abs(t.amount) : dollars(t.amount),
+    amount: parseArm(arm).rawAmount ? Math.abs(t.amount) : dollars(t.amount),
     type: t.amount > 0 ? 'Income' : 'Outcome',
     description: t.notes ?? '',
     payee: payeeName.get(t.payee) ?? '',
@@ -115,9 +142,9 @@ function render(t, arm) {
     date: t.date ?? '',
     hasWebSearchTool: false,
   };
-  const m = arm.match(/^h(\d+)$/);
-  if (!m) return compiled.base(ctx);
-  const hist = historyFor(t, Number(m[1]));
+  const a = parseArm(arm);
+  if (!a.histDays) return compiledFor(false, a.ng, a.nm)(ctx);
+  const hist = historyFor(t, a.histDays);
   const counts = {};
   for (const h of hist) counts[h.category] = (counts[h.category] ?? 0) + 1;
   ctx.history = hist.slice(0, HISTORY_SHOW).map((h) => ({
@@ -125,7 +152,7 @@ function render(t, arm) {
   }));
   ctx.historySummary = Object.entries(counts).sort((a, b) => b[1] - a[1])
     .map(([c, n]) => `${catName.get(c) ?? '?'} ×${n}`).join(', ');
-  return compiled.hist(ctx);
+  return compiledFor(true, a.ng, a.nm)(ctx);
 }
 
 async function ask(prompt) {
@@ -145,12 +172,20 @@ async function ask(prompt) {
   return { text: j.message?.content ?? '', promptTokens: j.prompt_eval_count, ms: Date.now() - t0 };
 }
 
+const catByName = new Map(allCats.map((c) => [c.name.trim().toLowerCase(), c.id]));
+const groupIds = new Set(groups.map((g) => g.id));
 function predict(text) {
   try {
-    const p = parseLlmResponse(text);
+    // The app's validator only knows categoryId; by-name answers are parsed directly.
+    const p = /"categoryName"/.test(text) ? JSON.parse(cleanJsonResponse(text)) : parseLlmResponse(text);
     if (p.type === 'new') return { kind: 'new' };
+    if (p.categoryName !== undefined && p.categoryId === undefined) {
+      const id = catByName.get(String(p.categoryName).trim().toLowerCase());
+      return id ? { kind: p.type, categoryId: id } : { kind: 'bad-name' };
+    }
     if (p.categoryId && catName.has(p.categoryId)) return { kind: p.type, categoryId: p.categoryId };
-    return { kind: p.categoryId ? 'bad-id' : 'no-category' };
+    if (p.categoryId) return { kind: groupIds.has(p.categoryId) ? 'bad-id-group' : 'bad-id' };
+    return { kind: 'no-category' };
   } catch { return { kind: 'parse-error' }; }
 }
 
@@ -194,6 +229,7 @@ for (const arm of arms) {
     `repeat ${pct(rows.filter((r) => r.seenBefore))}`,
     `new ${pct(rows.filter((r) => !r.seenBefore))}`,
     `no-rule ${pct(rows.filter((r) => !r.ruleCovered))}`,
+    `excl-CC ${pct(rows.filter((r) => catName.get(r.truth) !== 'Credit Cards'))}`,
     tok.length ? `tokens avg ${Math.round(tok.reduce((s, r) => s + r.promptTokens, 0) / tok.length)} max ${Math.max(...tok.map((r) => r.promptTokens))}` : '',
     tok.length ? `ms avg ${Math.round(tok.reduce((s, r) => s + r.ms, 0) / tok.length)}` : '',
     JSON.stringify(kinds),
